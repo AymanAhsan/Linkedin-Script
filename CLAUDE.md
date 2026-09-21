@@ -50,11 +50,28 @@ Status flow: `queued` → `connection_sent` → `connected` → `messaged` → `
 
 ## Key constraints
 
-**Browser automation uses Playwright against the user's real Chrome profile**
-(`--user-data-dir` pointed at it), not `chromium.launch()`. A fresh automated context
-gets fingerprinted and blocked quickly. This reduces detection risk; it does not
-eliminate it, since LinkedIn also detects behaviorally (action velocity, volume over
-days/weeks, DOM interaction patterns).
+**Auth is a saved `storage_state.json`, never a Chrome `--user-data-dir`.** An earlier
+revision of this spec called for copying the real Chrome profile. That was dropped: the
+cookie encryption key lives in `Local State` at the user-data *root*, is DPAPI-bound to
+the Windows account, and (Chrome 127+) is further protected by App-Bound Encryption — so
+a copied profile comes up silently logged out, and can't travel off the machine anyway.
+`storage_state` carries the same session as plaintext JSON, runs on a throwaway temp
+profile (real Chrome stays open), and is portable.
+
+The surviving insight from that revision: **never script the login form.** LinkedIn
+fingerprints the login page far harder than ordinary browsing. `cli.py login` opens a
+headed window for a manual, human sign-in and saves the session; everything else runs
+off that file and fails loudly when it expires rather than re-authing.
+
+Keep `channel="chrome"` (real Chrome, not bundled Chromium) and a pinned fingerprint —
+fixed viewport/locale/timezone. Randomizing those per run is a stronger signal than a
+stable one. Add no launch flags beyond `--disable-blink-features=AutomationControlled`;
+`--no-sandbox` and friends are themselves fingerprintable.
+
+None of this eliminates detection risk. At this volume LinkedIn enforces mainly on
+behavior — action velocity, volume over days/weeks, and above all invite acceptance
+rate. Targeting quality is the real safety system; browser-surface hardening is a
+distant second.
 
 **Claude in Chrome is a dev tool here, not the runtime.** Use it to prototype and
 confirm LinkedIn DOM selectors interactively; the shipped automation must be a

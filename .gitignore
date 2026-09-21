@@ -3,3 +3,7 @@ __pycache__/
 venv/
 config.json
 state.db
+storage_state.json
+
+.env
+debug/
