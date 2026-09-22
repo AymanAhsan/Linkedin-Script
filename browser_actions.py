@@ -13,9 +13,13 @@ stays manual on purpose.
 
 import asyncio
 import random
+import re
 from pathlib import Path
+from urllib.parse import unquote
+
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from cli import load_config
-from db import add_prospects, get_conn
+from db import add_prospects, find_queued_prospects, get_conn, set_connection_status
 from env_config import STORAGE_STATE
 
 # Pinned so every run presents the same device. Randomizing these per run is a
@@ -118,40 +122,6 @@ async def save_login(playwright) -> None:
     await browser.close()
     print(f"Session saved to {STORAGE_STATE}")
     print("This file is your logged-in account — keep it out of version control.")
-
-async def connect_users(page, users: list[dict]) -> None:
-    """Connect with a list of users on LinkedIn.
-
-    The caller supplies the already-open page so connection requests reuse the
-    current browser/context. Each user is a dict with keys 'profile_url' and
-    optionally 'message'. Browser lifetime is owned by the caller.
-    """
-    for user in users:
-        profile_url = user["profile_url"]
-        message = user.get("message", "")
-
-        await page.goto(profile_url, wait_until="domcontentloaded")
-
-        if _is_checkpoint(page.url):
-            raise CheckpointError(f"Checkpoint hit while loading {profile_url}.")
-
-        # Click the Connect button
-        connect_button = await page.query_selector("button[aria-label='Connect']")
-        if connect_button:
-            await connect_button.click()
-            # If there's a message box, fill it in
-            message_box = await page.query_selector("textarea[name='message']")
-            if message_box and message:
-                await message_box.fill(message)
-            # Click the Send button
-            send_button = await page.query_selector("button[aria-label='Send now']")
-            if send_button:
-                await send_button.click()
-                print(f"Sent connection request to {profile_url}")
-            else:
-                print(f"Could not find Send button for {profile_url}")
-        else:
-            print(f"Could not find Connect button for {profile_url}")
 
 # LinkedIn's search UI is server-driven with hashed class names, so this keys off
 # ARIA roles and semantic attributes only. Card links are nested inside each
@@ -351,6 +321,98 @@ def queue_users(users: list[dict], db_path: str = "state.db") -> None:
     finally:
         conn.close()
 
+def _vanity_name(url: str) -> str | None:
+    """The profile slug from /in/<slug>/, read from the post-redirect URL."""
+    m = re.search(r"/in/([^/?#]+)", url)
+    return unquote(m.group(1)) if m else None
+
+
+async def _find_connect(page, vanity: str):
+    """Locate this profile's own Connect control, or None if it has none.
+
+    Connect is an <a componentkey="ConnectButton…" href="/preload/custom-invite/
+    ?vanityName=<slug>"> — not a <button>. The profile top card has three layouts:
+    Connect inline (1st/2nd), Connect after a Follow button (creator profiles),
+    or Connect only inside the "More" menu (Follow is primary). The href is keyed
+    to the slug so the "More profiles for you" sidebar, which has Connect links
+    for other people, can't match; `main` + `:visible` excludes the hidden
+    sticky-header copy that sits under the nav bar and swallows clicks.
+    """
+    attrs = f'[componentkey^="ConnectButton"][href*="vanityName={vanity}" i]'
+    inline = page.locator(f"main a{attrs}:visible")
+    more = page.locator("main").get_by_role("button", name="More", exact=True)
+
+    # Hydration order isn't guaranteed; the More button is present in all three
+    # layouts, so once it (or Connect) exists the top card has rendered.
+    try:
+        await inline.or_(more).first.wait_for(state="visible", timeout=10000)
+    except PlaywrightTimeoutError:
+        return None
+
+    if await inline.count():
+        return inline.first
+
+    # The button is visible before its handler attaches, so an early click can
+    # be a silent no-op. Retry, but never click a menu that is already open.
+    menu_item = page.locator(f'a[role="menuitem"]{attrs}')
+    for _ in range(3):
+        if await more.first.get_attribute("aria-expanded") != "true":
+            await more.first.click()
+        try:
+            await menu_item.first.wait_for(state="visible", timeout=2500)
+            return menu_item.first
+        except PlaywrightTimeoutError:
+            await asyncio.sleep(1)
+
+    await page.keyboard.press("Escape")  # already connected/pending/etc.
+    return None
+
+
+async def connect_users(page, users: list[dict]) -> None:
+    """Connect with a list of users on LinkedIn.
+
+    The caller supplies the already-open page so connection requests reuse the
+    current browser/context. Each user is a dict with keys 'profile_url' and
+    optionally 'message'. Browser lifetime is owned by the caller.
+    """
+    for n, user in enumerate(users):
+        profile_url = user["profile_url"]
+        message = user.get("message", "")
+
+        if n:
+            await asyncio.sleep(random.uniform(20, 60))
+
+        await page.goto(profile_url, wait_until="domcontentloaded")
+
+        if _is_checkpoint(page.url):
+            raise CheckpointError(f"Checkpoint hit while loading {profile_url}.")
+
+        vanity = _vanity_name(page.url)
+        connect = await _find_connect(page, vanity) if vanity else None
+        if connect is None:
+            print(f"Could not find Connect button for {profile_url}")
+            continue
+
+        await connect.click()
+
+        # The invite dialog is rendered in a shadow root; Playwright's role and
+        # CSS locators pierce it. Step 1 offers "Add a note" / "Send without a
+        # note"; the note textarea and "Send invitation" only exist after Add.
+        if message:
+            await page.get_by_role("button", name="Add a note").click()
+            await page.locator("textarea[name='message']").fill(message)
+            send = page.get_by_role("button", name="Send invitation")
+        else:
+            send = page.get_by_role("button", name="Send without a note")
+
+        try:
+            await send.click(timeout=8000)
+        except Exception:
+            print(f"Could not find Send button for {profile_url}")
+            continue
+        set_connection_status(user["id"])
+        print(f"Sent connection request to {profile_url}")
+
 
 async def run(
     playwright, url: str, users: list[dict] | None = None
@@ -371,7 +433,16 @@ async def run(
         users = await get_users(page)
         queue_users(users)
 
-        print("Signed in. Press Ctrl+C in the terminal to close.")
+        print("Would you like to continue the sequence? (y/n): ", end="")
+        choice = await asyncio.to_thread(input)
+        if choice.lower() == "y":
+            await find_queued_prospects()
+        else:
+            print("Sequence aborted. You can run the 'continue' command later to connect with queued users.")
         await asyncio.Event().wait()
     finally:
         await browser.close()
+
+
+
+    

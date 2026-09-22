@@ -13,6 +13,7 @@ from playwright.async_api import async_playwright
 
 import browser_actions
 from config import link_builder
+from db import find_queued_prospects
 
 
 def load_config() -> dict:
@@ -23,6 +24,7 @@ def load_config() -> dict:
 async def cmd_login() -> None:
     async with async_playwright() as playwright:
         await browser_actions.save_login(playwright)
+
 
 
 async def cmd_search() -> None:
@@ -41,9 +43,11 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("login", help="sign in by hand and save the session")
     sub.add_parser("search", help="open the configured LinkedIn search")
+    sub.add_parser("continue", help="runs the current sequence")
 
+    
     args = parser.parse_args()
-    handler = {"login": cmd_login, "search": cmd_search}[args.command]
+    handler = {"login": cmd_login, "search": cmd_search, "continue": find_queued_prospects}[args.command]
 
     try:
         asyncio.run(handler())
