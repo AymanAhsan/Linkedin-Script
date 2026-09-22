@@ -14,12 +14,13 @@ stays manual on purpose.
 import asyncio
 import random
 import re
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from cli import load_config
-from db import add_prospects, find_queued_prospects, get_conn, set_connection_status
+from db import add_prospects, find_queued_prospects, get_conn, mark_connection_sent, mark_messaged
 from env_config import STORAGE_STATE
 
 # Pinned so every run presents the same device. Randomizing these per run is a
@@ -38,6 +39,7 @@ LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 
 LOGIN_URL = "https://www.linkedin.com/login"
 FEED_URL = "https://www.linkedin.com/feed/"
+CONNECTIONS_URL = "https://www.linkedin.com/mynetwork/invite-connect/connections/"
 
 
 class CheckpointError(RuntimeError):
@@ -327,6 +329,107 @@ def _vanity_name(url: str) -> str | None:
     return unquote(m.group(1)) if m else None
 
 
+_CONNECTION_CARD = '[componentkey^="ConnectionCard_"]'
+
+# The connections list uses the same hashed-class markup as search results, but
+# each card carries a stable componentkey ("ConnectionCard_<n>-<vanity>"), which
+# is a far more reliable anchor than the class soup. Name is the first <p>; its
+# next sibling is the headline. Picking headline by "first <span> in the card"
+# looked right when checked by eye (images already loaded) but broke on a fresh
+# load, where an unloaded avatar inserts a stray leading <span> and shifts
+# everything — nextElementSibling of the name is stable regardless.
+_CONNECTIONS_JS = """
+() => {
+  const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  return [...document.querySelectorAll('[componentkey^="ConnectionCard_"]')].flatMap((card) => {
+    const link = card.querySelector('a[href*="/in/"]');
+    const nameP = card.querySelector('p');
+    if (!link || !nameP) return [];
+    const ps = [...card.querySelectorAll('p')].map((p) => clean(p.innerText));
+    const headlineText = clean(nameP.nextElementSibling?.innerText);
+    const connectedP = ps.find((t) => /^Connected on/.test(t));
+    return [{
+      name: clean(nameP.innerText) || null,
+      headline: /^Connected on/.test(headlineText) ? '' : headlineText,
+      connected_on: connectedP ? connectedP.replace(/^Connected on /, '') : null,
+      profile_url: link.href.split('?')[0],
+    }];
+  });
+}
+"""
+
+
+def _parse_connected_on(text: str | None):
+    """"September 19, 2026" -> date(2026, 9, 19); None if unparseable."""
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%B %d, %Y").date()
+    except ValueError:
+        return None
+
+
+async def get_connections(
+    page, limit: int | None = None, stop_before=None
+) -> dict[str, dict]:
+    """Scrape /mynetwork/invite-connect/connections/, sorted "Recently added".
+
+    Cards load lazily on genuine scroll input — a wheel event, not a jump to
+    document.body.scrollHeight, which LinkedIn silently ignores here (unlike the
+    search results pager, there is no "Next" control to click instead). Stops
+    once `limit` people are collected, once every card on a scraped batch is
+    older than `stop_before` (a `date`; the list is chronological so nothing
+    further down can be newer), or after three scrolls in a row add nobody new.
+
+    Returns a dict keyed by vanity name (LinkedIn's `check-replies` matching key
+    per CLAUDE.md) with 'name', 'headline', 'connected_on' (e.g. "September 19,
+    2026", LinkedIn's own display string, not parsed to a date) and
+    'profile_url'.
+    """
+    await page.goto(CONNECTIONS_URL, wait_until="domcontentloaded")
+    if _is_checkpoint(page.url):
+        raise CheckpointError(f"Checkpoint hit while loading {CONNECTIONS_URL}.")
+
+    await page.wait_for_selector(_CONNECTION_CARD, timeout=25000)
+    # The infinite-scroll trigger only fires once the mouse has actually been
+    # placed over the page; a wheel event at Playwright's default (0, 0) is
+    # silently ignored, unlike a real user's cursor which is never there.
+    await page.mouse.move(640, 400)
+
+    collected: dict[str, dict] = {}
+
+    async def _scrape_and_merge() -> bool:
+        """Merge new cards; returns True once a card is older than stop_before."""
+        cards = await page.evaluate(_CONNECTIONS_JS)
+        past_boundary = False
+        for u in cards:
+            if stop_before is not None:
+                d = _parse_connected_on(u["connected_on"])
+                if d is not None and d < stop_before:
+                    past_boundary = True
+                    continue
+            vanity = _vanity_name(u["profile_url"])
+            if vanity and vanity not in collected:
+                collected[vanity] = u
+        return past_boundary and bool(cards)
+
+    if await _scrape_and_merge():
+        return collected
+
+    stall = 0
+    while stall < 3 and (limit is None or len(collected) < limit):
+        before = len(collected)
+        await page.mouse.wheel(0, 3000)
+        await asyncio.sleep(random.uniform(1.0, 2.0))
+        if await _scrape_and_merge():
+            break
+        stall = stall + 1 if len(collected) == before else 0
+
+    if limit is not None and len(collected) > limit:
+        collected = dict(list(collected.items())[:limit])
+    return collected
+
+
 async def _find_connect(page, vanity: str):
     """Locate this profile's own Connect control, or None if it has none.
 
@@ -410,8 +513,91 @@ async def connect_users(page, users: list[dict]) -> None:
         except Exception:
             print(f"Could not find Send button for {profile_url}")
             continue
-        set_connection_status(user["id"])
+        mark_connection_sent(user["id"])
         print(f"Sent connection request to {profile_url}")
+
+_COMPANY_CHIP = 'main a[href*="/company/"]'
+_MESSAGE_TEXT = re.compile(r"^Message$")
+_COMPOSE_BOX = ".msg-form__contenteditable"
+
+
+async def _current_company(page) -> str:
+    """Scrape the profile top card's "current company" chip.
+
+    This is a distinct, structured element (aria-label "View company: <Name>"),
+    unlike the free-text headline where company isn't cleanly separable. It's
+    always the first `/company/` link in DOM order -- later ones belong to the
+    Experience section further down the page.
+    """
+    chip = page.locator(_COMPANY_CHIP).first
+    if not await chip.count():
+        return ""
+    label = await chip.get_attribute("aria-label")
+    if label and label.startswith("View company: "):
+        return label[len("View company: "):]
+    return (await chip.inner_text()).strip()
+
+
+async def _find_message(page):
+    """Locate this profile's own Message control, or None if it has none.
+
+    Message is an <a>, not a <button>, with accessible name exactly "Message" --
+    matched exactly so this never picks up the unrelated "Message with Premium"
+    upsell link elsewhere on the page. As with Connect, there's a hidden
+    sticky-header duplicate outside `main` and another hidden copy inside it;
+    `main` + `:visible` leaves exactly the real one.
+    """
+    link = page.locator("main a:visible", has_text=_MESSAGE_TEXT)
+    try:
+        await link.first.wait_for(state="visible", timeout=10000)
+    except PlaywrightTimeoutError:
+        return None
+    return link.first
+
+
+async def message_users(page, users: list[dict], message_template: str) -> None:
+    """Send the one personalized follow-up message to each connected user.
+
+    The caller supplies the already-open page so messages reuse the current
+    browser/context. Each user is a dict with keys 'id', 'name', 'profile_url'.
+    Browser lifetime is owned by the caller.
+    """
+    for n, user in enumerate(users):
+        profile_url = user["profile_url"]
+
+        if n:
+            await asyncio.sleep(random.uniform(20, 60))
+
+        await page.goto(profile_url, wait_until="domcontentloaded")
+
+        if _is_checkpoint(page.url):
+            raise CheckpointError(f"Checkpoint hit while loading {profile_url}.")
+
+        company = await _current_company(page)
+        first_name = user["name"].split()[0]
+        message = message_template.format(first_name=first_name, company=company)
+
+        link = await _find_message(page)
+        if link is None:
+            print(f"Could not find Message button for {profile_url}")
+            continue
+
+        await link.click()
+
+        # The compose overlay is rendered in an open shadow root (a site-wide
+        # messaging widget); Playwright locators pierce it transparently, same as
+        # the invite-note dialog above.
+        box = page.locator(_COMPOSE_BOX)
+        try:
+            await box.wait_for(state="visible", timeout=10000)
+            await box.fill(message)
+            await page.get_by_role("button", name="Send", exact=True).click(timeout=8000)
+        except Exception:
+            print(f"Could not send message for {profile_url}")
+            continue
+
+        mark_messaged(user["id"], company)
+        print(f"Sent message to {profile_url}")
 
 
 async def run(

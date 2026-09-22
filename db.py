@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Create a table to store the state
 
@@ -95,14 +95,161 @@ async def find_queued_prospects():
         finally:
             await browser.close()
 
-def set_connection_status(prospect_id):
-    """Update the status of a prospect in the database."""
-
-    # Get current datetime
+def mark_connection_sent(prospect_id, db_path="state.db"):
+    """Record that an invite was just sent; does not mean it was accepted."""
     now = datetime.now().isoformat()
-    conn = get_conn(path="state.db")
+    conn = get_conn(path=db_path)
+    conn.execute(
+        "UPDATE prospects SET status = 'connection_sent', connection_sent_at = ? WHERE id = ?",
+        (now, prospect_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_connected(prospect_id, db_path="state.db"):
+    """Record that `check-replies` confirmed a pending invite was accepted."""
+    now = datetime.now().isoformat()
+    conn = get_conn(path=db_path)
     conn.execute(
         "UPDATE prospects SET status = 'connected', connected_at = ? WHERE id = ?",
         (now, prospect_id)
     )
     conn.commit()
+    conn.close()
+
+
+def select_pending_connections(conn):
+    """Prospects whose invite was sent but not yet confirmed accepted.
+
+    Oldest send first, since that date is the boundary `check-replies` scans
+    the connections page down to.
+    """
+    return conn.execute(
+        "SELECT id, name, profile_url, connection_sent_at FROM prospects "
+        "WHERE status = 'connection_sent' "
+        "ORDER BY connection_sent_at ASC"
+    ).fetchall()
+
+
+async def check_replies(db_path="state.db"):
+    """Promote 'connection_sent' prospects to 'connected' once LinkedIn confirms.
+
+    Walks the connections page (sorted "Recently added" by LinkedIn) and
+    matches against prospects awaiting confirmation, by vanity name. Stops
+    scanning once every card is older than the oldest pending invite's send
+    date -- nothing further down the list can be a match.
+    """
+    # Imported here: cli and browser_actions import this module at load time.
+    from playwright.async_api import async_playwright
+    import browser_actions
+
+    conn = get_conn(path=db_path)
+    pending = select_pending_connections(conn)
+    if not pending:
+        print("Nothing pending: no prospects with status='connection_sent'.")
+        return
+
+    by_vanity = {}
+    for row in pending:
+        vanity = browser_actions._vanity_name(row["profile_url"])
+        if vanity:
+            by_vanity[vanity] = row
+
+    oldest_sent = min(
+        datetime.fromisoformat(row["connection_sent_at"]).date() for row in pending
+    )
+
+    async with async_playwright() as playwright:
+        browser, context = await browser_actions.launch(playwright)
+        try:
+            page = await context.new_page()
+            await browser_actions.assert_logged_in(page)
+            connections = await browser_actions.get_connections(
+                page, stop_before=oldest_sent
+            )
+        finally:
+            await browser.close()
+
+    matched = 0
+    for vanity, row in by_vanity.items():
+        if vanity in connections:
+            mark_connected(row["id"], db_path=db_path)
+            matched += 1
+            print(f"Connected: {row['name']} ({vanity})")
+
+    print(f"{matched} of {len(pending)} pending invites confirmed connected.")
+
+def select_prospects_to_message(conn, daily_limit, wait_days, now=None):
+    """Return connected prospects who are due their one follow-up message.
+
+    Only 'connected' rows with no messaged_at qualify, and only once they've been
+    connected at least wait_days -- matches CLAUDE.md's connect -> wait -> message
+    sequence. Oldest connection first, capped at whatever is left of daily_limit
+    after the messages already sent since midnight today.
+    """
+    now = now or datetime.now()
+    start_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = now - timedelta(days=wait_days)
+
+    sent_today = conn.execute(
+        "SELECT COUNT(*) FROM prospects WHERE messaged_at >= ?",
+        (start_of_today.isoformat(),),
+    ).fetchone()[0]
+
+    remaining = daily_limit - sent_today
+    if remaining <= 0:
+        return []
+    return conn.execute(
+        "SELECT id, name, profile_url, title FROM prospects "
+        "WHERE status = 'connected' AND messaged_at IS NULL AND connected_at <= ? "
+        "ORDER BY connected_at ASC LIMIT ?",
+        (cutoff.isoformat(), remaining),
+    ).fetchall()
+
+
+def mark_messaged(prospect_id, company, db_path="state.db"):
+    """Record that the one follow-up message was just sent.
+
+    Also backfills company from the freshly scraped profile chip, without
+    clobbering an existing value if this particular scrape came back empty.
+    """
+    now = datetime.now().isoformat()
+    conn = get_conn(path=db_path)
+    conn.execute(
+        "UPDATE prospects SET status = 'messaged', messaged_at = ?, "
+        "company = COALESCE(NULLIF(?, ''), company) WHERE id = ?",
+        (now, company, prospect_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def send_due_messages():
+    """Send the one follow-up message to every connection that's due it."""
+    # Imported here: cli and browser_actions import this module at load time.
+    from playwright.async_api import async_playwright
+    import browser_actions
+    from cli import load_config
+
+    config = load_config()
+    conn = get_conn(path="state.db")
+    daily_limit = config.get("daily_message_limit", 5)
+    wait_days = config.get("wait_days_before_message", 2)
+    message_template = config["message_template"]
+
+    rows = select_prospects_to_message(conn, daily_limit, wait_days)
+    if not rows:
+        print(f"Nothing to send: daily limit of {daily_limit} reached or nobody due yet.")
+        return
+
+    users = [dict(row) for row in rows]
+
+    async with async_playwright() as playwright:
+        browser, context = await browser_actions.launch(playwright)
+        try:
+            page = await context.new_page()
+            await browser_actions.assert_logged_in(page)
+            await browser_actions.message_users(page, users, message_template)
+        finally:
+            await browser.close()
