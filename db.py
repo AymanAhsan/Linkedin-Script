@@ -1,6 +1,14 @@
 import sqlite3
 from datetime import datetime, timedelta
 
+PROSPECT_STATUSES = (
+    "queued",
+    "connection_sent",
+    "connected",
+    "messaged",
+    "replied",
+)
+
 # Create a table to store the state
 
 SCHEMA = """
@@ -40,6 +48,23 @@ def add_prospects(conn, prospects):
         prospects,
     )
     conn.commit()
+
+
+def list_prospects(conn, statuses=None):
+    """Return prospects, optionally limited to one or more lifecycle statuses."""
+    query = (
+        "SELECT id, name, profile_url, company, title, status, "
+        "connection_sent_at, connected_at, messaged_at FROM prospects"
+    )
+    parameters = []
+
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        query += f" WHERE status IN ({placeholders})"
+        parameters.extend(statuses)
+
+    query += " ORDER BY id"
+    return conn.execute(query, parameters).fetchall()
 
 
 def select_prospects_to_connect(conn, daily_limit, now=None):
